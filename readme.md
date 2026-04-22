@@ -120,7 +120,7 @@ The environment can inject one attack per episode (or no attack, depending on co
 
 The reward follows the same high-level logic as the paper:
 
-R = w_sec * R_security + w_proc * R_process + w_cost * R_cost
+`R = w_sec * R_security + w_proc * R_process + w_cost * R_cost`
 
 with the final local weights:
 
@@ -160,3 +160,201 @@ project-root/
 ├── sample_episode_stress_seed_11.png
 ├── README.md
 └── requirements.txt
+```
+
+---
+
+## Requirements
+
+### Python version
+- Python **3.9+** is recommended.
+
+### Python libraries
+Install the required packages with:
+
+```bash
+pip install torch numpy matplotlib requests pettingzoo gymnasium
+```
+
+If you want a `requirements.txt`, it should include at least:
+
+```text
+torch
+numpy
+matplotlib
+requests
+pettingzoo
+gymnasium
+```
+
+### Local LLM requirement
+This project expects a **local Ollama server** and a **Llama 3 model** for the semantic context channel.
+
+Start Ollama:
+
+```bash
+ollama serve
+```
+
+Pull the model used by the project:
+
+```bash
+ollama pull llama3
+```
+
+If your `src/utils/llm_client.py` is configured for a different local model name, update it there and pull that model instead.
+
+### Quick setup
+```bash
+pip install torch numpy matplotlib requests pettingzoo gymnasium
+ollama serve
+ollama pull llama3
+```
+
+---
+
+## Installation
+
+### 1) Python
+Use Python 3.9+.
+
+### 2) Dependencies
+Install the required libraries:
+
+```bash
+pip install torch numpy matplotlib requests pettingzoo gymnasium
+```
+
+### 3) Local LLM backend
+Run **Ollama** locally:
+
+```bash
+ollama serve
+```
+
+Then pull the model expected by the project:
+
+```bash
+ollama pull llama3
+```
+
+> If your local config points to a different model name, update `src/utils/llm_client.py` accordingly.
+
+---
+
+## How to Run
+
+### Train from scratch
+```bash
+python -m src.train
+```
+
+This trains the 4-agent policy and saves weights into `models/`.
+
+### Run final evaluation
+```bash
+python -m src.evaluate
+```
+
+The final evaluation script runs:
+- **Base evaluation**
+- **Stress evaluation**
+- **5 random seeds**
+- mean ± std summary across runs
+
+It also writes per-seed CSV logs to `logs/` and saves representative trajectory plots.
+
+---
+
+## Typical Outputs
+
+Running evaluation should generate files such as:
+
+- `logs/eval_base_seed_11.csv`
+- `logs/eval_base_seed_22.csv`
+- `logs/eval_stress_seed_11.csv`
+- `logs/eval_stress_seed_22.csv`
+- `sample_episode_base_seed_11.png`
+- `sample_episode_stress_seed_11.png`
+
+These artifacts were used in the final report and presentation.
+
+---
+
+## What Changed During the Project
+
+This project went through several major revisions.
+
+### Early issue: perfect-looking scores
+At one stage, the system achieved near-100% results in a way that looked too easy.  
+The fix was **not** endless retraining. Instead, the final version added a **held-out stress evaluation**.
+
+### Early issue: containment without recovery
+A more serious bug appeared when the anomaly would clear, but the plant would still drift away from the setpoint afterward.
+
+The final version fixed this by adding:
+- an explicit **recovery mode**
+- a tighter **safe operating band**
+- a **hold condition** before exiting recovery
+
+This made the sample trajectories much more realistic.
+
+---
+
+## Main Findings
+
+1. **The LLM semantic channel helps shape the tactical state.**
+2. **Recovery matters as much as containment in CPS defense.**
+3. **Single-setting near-perfect performance is not a good headline result.**
+4. **Held-out stress evaluation is far more meaningful than one easy score.**
+5. **Stealth drain is the hardest attack family in the final setup.**
+6. **The learned mitigation policy is still somewhat narrow** (notably, action 2 was never used in the final runs).
+
+---
+
+## Limitations
+
+This is still a **simplified simulator**, not a full reproduction of the original paper.
+
+Limitations include:
+- no direct SWaT replay pipeline
+- simplified plant physics
+- simplified cyber telemetry
+- compact LLM semantic channel instead of a full orchestration pipeline
+- limited attack diversity
+- a mitigation policy that still underuses part of the action space
+
+So the results should be interpreted as:
+- a **working proof-of-concept implementation**
+- a **course project extension**
+- not a claim of real-world deployment readiness
+
+---
+
+## Links
+
+- **Paper reviewed:** *L2M-AID: Autonomous Cyber-Physical Defense by Fusing Semantic Reasoning of Large Language Models with Multi-Agent Reinforcement Learning*
+- **GitHub repository:** `<PASTE_GITHUB_LINK_HERE>`
+- **Technical report (LaTeX/PDF):** `<PASTE_REPORT_LINK_HERE>`
+- **Presentation slides:** `<PASTE_SLIDES_LINK_HERE>`
+
+---
+
+## Suggested Citation
+
+If you want to cite this repository in your report or slides, use something like:
+
+```bibtex
+@misc{l2maid_course_project_2026,
+  title        = {L2M-AID-Style Autonomous Cyber-Physical Defense with Neuro-Symbolic MARL},
+  author       = {Your Name and Your Partner Name},
+  year         = {2026},
+  note         = {Course project implementation and experimental extension}
+}
+```
+
+---
+
+## Acknowledgment
+
+This project was developed as part of a course assignment on **AI Agents in Cybersecurity**. It builds on the ideas introduced in the L2M-AID paper while implementing a simplified simulation and a held-out stress evaluation designed to test robustness in a more realistic way.

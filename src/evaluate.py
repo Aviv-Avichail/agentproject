@@ -3,7 +3,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from src.utils.llm_client import LLMClient
-from src.utils.logger import L2MAID_Logger  # 👉 ADDED LOGGER IMPORT
+from src.utils.logger import L2MAID_Logger
 from src.envs.cps_env import L2MAID_MARL_Env
 from src.agents.mappo_agent import MAPPO_CTDE
 
@@ -16,7 +16,7 @@ def load_mappo_models(mappo, directory="models", prefix="l2maid"):
     try:
         for agent in mappo.agents:
             model_path = f"{directory}/{prefix}_actor_{agent}.pth"
-            mappo.actors[agent].load_state_dict(torch.load(model_path))
+            mappo.actors[agent].load_state_dict(torch.load(model_path, map_location="cpu"))
             mappo.actors[agent].eval()
         print(f"✅ Successfully loaded decentralized Actor networks from '{directory}'")
         return True
@@ -26,7 +26,7 @@ def load_mappo_models(mappo, directory="models", prefix="l2maid"):
 
 
 def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
-    """Generates a graph of the physical plant and the agent's response for the presentation."""
+    """Generates a graph of the physical plant and the agent's response."""
     steps = range(len(trajectory["levels"]))
 
     plt.figure(figsize=(12, 6))
@@ -38,13 +38,21 @@ def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
     plt.axhline(y=100.0, color="red", linestyle=":", label="Catastrophic Overflow")
     plt.axhline(y=0.0, color="red", linestyle=":", label="Catastrophic Drain")
 
-    # Mark where the attack started and where the mitigation happened
     if trajectory["attack_step"] > 0:
-        plt.axvline(x=trajectory["attack_step"], color="orange", linestyle="-",
-                    label=f"Attack Injected ({trajectory['attack_type']})")
+        plt.axvline(
+            x=trajectory["attack_step"],
+            color="orange",
+            linestyle="-",
+            label=f"Attack Injected ({trajectory['attack_type']})"
+        )
     if trajectory["mitigation_step"] > 0:
-        plt.axvline(x=trajectory["mitigation_step"], color="purple", linestyle="-", linewidth=2,
-                    label="Mitigator Action")
+        plt.axvline(
+            x=trajectory["mitigation_step"],
+            color="purple",
+            linestyle="-",
+            linewidth=2,
+            label="Mitigator Action"
+        )
 
     plt.title("Cyber-Physical Trajectory (Sample Episode)")
     plt.ylabel("Water Level")
@@ -68,21 +76,37 @@ def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
     plt.close()
 
 
-def evaluate(episodes=100, debug_mode=True):
+def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
     print(f"\n{'=' * 50}\n🔬 RUNNING GRANULAR 4-AGENT EVALUATION\n{'=' * 50}")
 
     llm = LLMClient(debug_mode=debug_mode)
-    logger = L2MAID_Logger()  # 👉 INITIALIZED LOGGER
+    logger = L2MAID_Logger()
     env = L2MAID_MARL_Env(llm_client=llm, debug_mode=debug_mode)
 
-    obs_dims = {"network_agent": 8, "host_agent": 8, "threat_intel_agent": 7, "mitigator_agent": 11}
-    act_dims = {"network_agent": 2, "host_agent": 2, "threat_intel_agent": 2, "mitigator_agent": 4}
+    obs_dims = {
+        "network_agent": 8,
+        "host_agent": 8,
+        "threat_intel_agent": 7,
+        "mitigator_agent": 11
+    }
+    act_dims = {
+        "network_agent": 2,
+        "host_agent": 2,
+        "threat_intel_agent": 2,
+        "mitigator_agent": 4
+    }
+
     mappo = MAPPO_CTDE(obs_dims, act_dims)
 
     if not load_mappo_models(mappo):
         return
 
-    # Advanced Tracking
+    if use_rule_based_mitigator:
+        print("🧪 Diagnostic mode ON: overriding mitigator with IOC-based sanity rule.")
+        print("   Rule: if mitigator obs[4] (ioc_match) > 0.5 -> action 1, else action 0.\n")
+    else:
+        print("🤖 Using learned mitigator policy only.\n")
+
     metrics = {
         "overflow": {"tp": 0, "fn": 0, "response_times": []},
         "stealth_drain": {"tp": 0, "fn": 0, "response_times": []},
@@ -92,7 +116,15 @@ def evaluate(episodes=100, debug_mode=True):
     global_tn = 0
     psi_scores = []
 
-    sample_trajectory = {"levels": [], "cpus": [], "attack_step": -1, "mitigation_step": -1, "attack_type": ""}
+    mitigator_action_hist = {0: 0, 1: 0, 2: 0, 3: 0}
+
+    sample_trajectory = {
+        "levels": [],
+        "cpus": [],
+        "attack_step": -1,
+        "mitigation_step": -1,
+        "attack_type": ""
+    }
 
     for ep in range(episodes):
         obs_dict, _ = env.reset()
@@ -101,7 +133,6 @@ def evaluate(episodes=100, debug_mode=True):
         attack_start_step = env.attack_trigger_step
         current_attack_type = env.attack_type
 
-        # Only save detailed trajectory for the very first episode
         is_sample_ep = (ep == 0)
         if is_sample_ep:
             sample_trajectory["attack_type"] = current_attack_type
@@ -113,32 +144,43 @@ def evaluate(episodes=100, debug_mode=True):
                 sample_trajectory["cpus"].append(env.cpu_load)
 
             actions = {}
+
             with torch.no_grad():
                 for agent in env.agents:
                     obs_tensor = torch.FloatTensor(obs_dict[agent]).unsqueeze(0)
                     logits = mappo.actors[agent].net(obs_tensor)
-                    actions[agent] = torch.argmax(logits).item()
+                    actions[agent] = torch.argmax(logits, dim=-1).item()
 
-            # 1. STATE CHECK
-            is_anomaly = env.raw_anomaly == 1.0
+            # Temporary diagnostic override for the mitigator:
+            # mitigator obs = [level, pump, valve, cpu, ioc_match] + comm_buffer + llm_vector
+            if use_rule_based_mitigator and "mitigator_agent" in obs_dict:
+                ioc_match = obs_dict["mitigator_agent"][4]
+                actions["mitigator_agent"] = 1 if ioc_match > 0.5 else 0
+
             mit_act = actions.get("mitigator_agent", 0)
+            mitigator_action_hist[mit_act] = mitigator_action_hist.get(mit_act, 0) + 1
+
+            # State before stepping
+            is_anomaly = env.raw_anomaly == 1.0
             current_level = env.level
             current_cpu = env.cpu_load
 
-            # 2. EXTRACT LLM DECISION (For the logger)
             llm_vec = obs_dict["mitigator_agent"][-3:]
             llm_choice = "Attack" if llm_vec[0] > 0.5 else "Normal"
 
-            # 3. TAKE STEP
             next_obs_dict, rewards, terminations, _, _ = env.step(actions)
 
-            # 👉 4. WRITE TO CSV LOGGER
             logger.log_step(
-                ep, env.steps, current_attack_type, current_level,
-                current_cpu, llm_choice, mit_act, is_anomaly
+                ep,
+                env.steps,
+                current_attack_type,
+                current_level,
+                current_cpu,
+                llm_choice,
+                mit_act,
+                is_anomaly
             )
 
-            # Metrics
             if is_anomaly:
                 if mit_act > 0 and not attack_detected:
                     metrics[current_attack_type]["tp"] += 1
@@ -167,10 +209,8 @@ def evaluate(episodes=100, debug_mode=True):
         if (ep + 1) % 10 == 0:
             print(f"[EVAL] Completed episode {ep + 1}/{episodes}")
 
-    # Generate the sample plot
     plot_sample_episode(sample_trajectory)
 
-    # Calculate overall metrics
     total_tp = sum(m["tp"] for m in metrics.values())
     total_fn = sum(m["fn"] for m in metrics.values())
     all_responses = sum((m["response_times"] for m in metrics.values()), [])
@@ -186,8 +226,12 @@ def evaluate(episodes=100, debug_mode=True):
     print(f"Overall Detection Rate (DR):   {overall_dr:.2f}%")
     print(f"Overall False Positive (FPR):  {overall_fpr:.2f}%")
     print(f"Average Process Stability:     {np.mean(psi_scores):.4f}")
-    print("\n--- BREAKDOWN BY ATTACK VECTOR ---")
+    print(f"Average Response Time:         {overall_mttr:.2f} steps")
+    print("\nMitigator Action Histogram:")
+    for action_id in sorted(mitigator_action_hist.keys()):
+        print(f"  Action {action_id}: {mitigator_action_hist[action_id]}")
 
+    print("\n--- BREAKDOWN BY ATTACK VECTOR ---")
     for atk, data in metrics.items():
         atk_tp, atk_fn = data["tp"], data["fn"]
         atk_dr = (atk_tp / (atk_tp + atk_fn)) * 100 if (atk_tp + atk_fn) > 0 else 0
@@ -201,4 +245,4 @@ def evaluate(episodes=100, debug_mode=True):
 
 
 if __name__ == "__main__":
-    evaluate(episodes=100)
+    evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True)

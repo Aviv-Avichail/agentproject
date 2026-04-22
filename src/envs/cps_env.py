@@ -32,10 +32,31 @@ class L2MAID_MARL_Env(ParallelEnv):
 
         self.max_steps = 60
         self.setpoint = 50.0
-        self.w_sec = 5.0
+
+        # Rebalanced reward weights:
+        # security still matters most, but not so much that one exploratory mistake destroys learning
+        self.w_sec = 3.0
         self.w_proc = 1.0
 
         self.level_history = deque(maxlen=5)
+
+        # Reward tables (rebalanced)
+        self.true_positive_mitigation_reward = {
+            1: 18.0,   # mild mitigation
+            2: 28.0,   # quarantine
+            3: 40.0    # full shutdown
+        }
+
+        self.false_positive_mitigation_penalty = {
+            1: 2.0,    # small cost for cautious action
+            2: 6.0,    # moderate cost
+            3: 25.0    # still harsh for unnecessary shutdown
+        }
+
+        self.true_positive_detection_bonus = 2.0
+        self.false_positive_detection_penalty = 1.0
+        self.unresolved_attack_penalty = 12.0
+        self.catastrophic_failure_penalty = 300.0
 
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents.copy()
@@ -75,16 +96,22 @@ class L2MAID_MARL_Env(ParallelEnv):
 
         obs = {
             "network_agent": np.array([self.pump, self.valve] + self.comm_buffer + llm_vector, dtype=np.float32),
-            "host_agent": np.array([self.level / 100.0, self.cpu_load / 100.0] + self.comm_buffer + llm_vector,
-                                   dtype=np.float32),
+            "host_agent": np.array(
+                [self.level / 100.0, self.cpu_load / 100.0] + self.comm_buffer + llm_vector,
+                dtype=np.float32
+            ),
             "threat_intel_agent": np.array([self.ioc_match] + self.comm_buffer + llm_vector, dtype=np.float32),
-            "mitigator_agent": np.array([self.level / 100.0, self.pump, self.valve, self.cpu_load / 100.0,
-                                         self.ioc_match] + self.comm_buffer + llm_vector, dtype=np.float32)
+            "mitigator_agent": np.array(
+                [self.level / 100.0, self.pump, self.valve, self.cpu_load / 100.0, self.ioc_match]
+                + self.comm_buffer + llm_vector,
+                dtype=np.float32
+            )
         }
         return obs
 
     def step(self, actions):
-        if not self.agents: return {}, {}, {}, {}, {}
+        if not self.agents:
+            return {}, {}, {}, {}, {}
 
         net_act = actions.get("network_agent", 0)
         host_act = actions.get("host_agent", 0)
@@ -94,74 +121,109 @@ class L2MAID_MARL_Env(ParallelEnv):
         self.last_mit_act = mit_act
         self.comm_buffer = [float(net_act), float(host_act), float(intel_act)]
 
+        # Normal plant dynamics before attack injection
         if self.raw_anomaly == 0.0:
             self.valve = 1
             self.cpu_load = 25.0 + np.random.normal(0, 3.0)
             self.ioc_match = 0.0
+
             if self.level < 40.0:
                 self.pump = 1
             elif self.level > 60.0:
                 self.pump = 0
 
+        # Trigger attack at the chosen step
         if self.steps == self.attack_trigger_step:
             self.raw_anomaly = 1.0
 
+        # Attack dynamics
         if self.raw_anomaly == 1.0:
             if self.attack_type == "overflow":
-                self.pump = 1;
+                self.pump = 1
                 self.valve = 0
-                self.cpu_load = 88.0 + np.random.normal(0, 5.0);
-                self.ioc_match = 1.0
-            elif self.attack_type == "stealth_drain":
-                self.pump = 0;
-                self.valve = 1
-                self.cpu_load = 28.0 + np.random.normal(0, 2.0);
-                self.ioc_match = 1.0
-            elif self.attack_type == "ransomware":
-                self.pump = 0;
-                self.valve = 0
-                self.cpu_load = 99.0;
+                self.cpu_load = 88.0 + np.random.normal(0, 5.0)
                 self.ioc_match = 1.0
 
-        if self.pump == 1: self.level += 3.0
-        if self.valve == 1: self.level -= 3.0
+            elif self.attack_type == "stealth_drain":
+                self.pump = 0
+                self.valve = 1
+                self.cpu_load = 28.0 + np.random.normal(0, 2.0)
+                self.ioc_match = 1.0
+
+            elif self.attack_type == "ransomware":
+                self.pump = 0
+                self.valve = 0
+                self.cpu_load = 99.0
+                self.ioc_match = 1.0
+
+        # Physical process evolution
+        if self.pump == 1:
+            self.level += 3.0
+        if self.valve == 1:
+            self.level -= 3.0
         self.level += np.random.normal(0, 0.8)
 
         self.level_history.append(self.level)
 
+        # Reward calculation
         r_sec = 0.0
         r_proc = -abs(self.level - self.setpoint) / 20.0
 
         if self.raw_anomaly == 1.0:
-            if net_act == 1: r_sec += 5.0
-            if host_act == 1: r_sec += 5.0
-            if intel_act == 1: r_sec += 5.0
+            # Reward positive detections by the supporting agents
+            if net_act == 1:
+                r_sec += self.true_positive_detection_bonus
+            if host_act == 1:
+                r_sec += self.true_positive_detection_bonus
+            if intel_act == 1:
+                r_sec += self.true_positive_detection_bonus
 
+            # Penalize leaving a live attack unresolved every step
+            r_sec -= self.unresolved_attack_penalty
+
+            # Reward mitigation strongly enough to beat the "do nothing" local optimum
             if mit_act > 0:
+                r_sec += self.true_positive_mitigation_reward.get(mit_act, 0.0)
                 self.raw_anomaly = 0.0
-                r_sec += {1: 30.0, 2: 50.0, 3: 80.0}.get(mit_act, 0)
-            elif (net_act == 0 and host_act == 0 and intel_act == 0):
-                r_sec -= 40.0
-        else:
-            if net_act == 1: r_sec -= 5.0
-            if host_act == 1: r_sec -= 5.0
-            if intel_act == 1: r_sec -= 5.0
-            r_sec -= {1: 10.0, 2: 40.0, 3: 180.0}.get(mit_act, 0)
 
+        else:
+            # False positives by detector agents should hurt a little, but not catastrophically
+            if net_act == 1:
+                r_sec -= self.false_positive_detection_penalty
+            if host_act == 1:
+                r_sec -= self.false_positive_detection_penalty
+            if intel_act == 1:
+                r_sec -= self.false_positive_detection_penalty
+
+            # False-positive mitigation penalty:
+            # mild for cautious actions, harsh for unnecessary shutdown
+            if mit_act > 0:
+                r_sec -= self.false_positive_mitigation_penalty.get(mit_act, 0.0)
+
+        # Action 3 = full shutdown
         if mit_act == 3:
             self.pump, self.valve = 0, 0
 
         total_reward = (self.w_sec * r_sec) + (self.w_proc * r_proc)
+
         self.level = np.clip(self.level, 0.0, 100.0)
         self.steps += 1
 
         terminated = self.level >= 100.0 or self.level <= 0.0 or self.steps >= self.max_steps
-        if terminated and (self.level >= 100 or self.level <= 0):
-            total_reward -= 300.0
+
+        if terminated and (self.level >= 100.0 or self.level <= 0.0):
+            total_reward -= self.catastrophic_failure_penalty
 
         rewards = {a: float(total_reward) for a in self.agents}
         terminations = {a: terminated for a in self.agents}
 
-        if terminated: self.agents = []
-        return self._get_obs(), rewards, terminations, {a: False for a in self.possible_agents}, {a: {} for a in
-                                                                                                  self.possible_agents}
+        if terminated:
+            self.agents = []
+
+        return (
+            self._get_obs(),
+            rewards,
+            terminations,
+            {a: False for a in self.possible_agents},
+            {a: {} for a in self.possible_agents}
+        )

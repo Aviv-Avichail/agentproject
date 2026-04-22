@@ -1,7 +1,7 @@
 import numpy as np
-from src.utils.llm_client import LLMClient
-from src.envs.cps_env import L2MAID_MARL_Env
-from src.agents.mappo_agent import MAPPO_CTDE
+from utils.llm_client import LLMClient
+from envs.cps_env import L2MAID_MARL_Env
+from agents.mappo_agent import MAPPO_CTDE
 
 
 def train_agents(episodes=1000, debug_mode=False):

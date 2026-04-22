@@ -1,23 +1,23 @@
 import torch
 import numpy as np
 import os
+import matplotlib.pyplot as plt
 from src.utils.llm_client import LLMClient
+from src.utils.logger import L2MAID_Logger  # 👉 ADDED LOGGER IMPORT
 from src.envs.cps_env import L2MAID_MARL_Env
 from src.agents.mappo_agent import MAPPO_CTDE
 
 
 def load_mappo_models(mappo, directory="models", prefix="l2maid"):
-    """Helper to load the saved PyTorch weights into the MAPPO actors."""
     if not os.path.exists(directory):
         print(f"❌ Error: Directory '{directory}' not found. Train models first.")
         return False
 
     try:
-        # We don't need the Critic for evaluation (Decentralized Execution!)
         for agent in mappo.agents:
             model_path = f"{directory}/{prefix}_actor_{agent}.pth"
             mappo.actors[agent].load_state_dict(torch.load(model_path))
-            mappo.actors[agent].eval()  # Set to evaluation mode
+            mappo.actors[agent].eval()
         print(f"✅ Successfully loaded decentralized Actor networks from '{directory}'")
         return True
     except Exception as e:
@@ -25,57 +25,130 @@ def load_mappo_models(mappo, directory="models", prefix="l2maid"):
         return False
 
 
-def evaluate(episodes=100, debug_mode=False):
-    print(f"\n{'=' * 50}\n🔬 RUNNING 4-AGENT EVALUATION\n{'=' * 50}")
+def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
+    """Generates a graph of the physical plant and the agent's response for the presentation."""
+    steps = range(len(trajectory["levels"]))
 
-    # 1. Initialize Environment
+    plt.figure(figsize=(12, 6))
+
+    # Plot 1: Physical Water Level
+    plt.subplot(2, 1, 1)
+    plt.plot(steps, trajectory["levels"], label="Water Level", color="blue", linewidth=2)
+    plt.axhline(y=50.0, color="green", linestyle="--", label="Optimal Setpoint (50)")
+    plt.axhline(y=100.0, color="red", linestyle=":", label="Catastrophic Overflow")
+    plt.axhline(y=0.0, color="red", linestyle=":", label="Catastrophic Drain")
+
+    # Mark where the attack started and where the mitigation happened
+    if trajectory["attack_step"] > 0:
+        plt.axvline(x=trajectory["attack_step"], color="orange", linestyle="-",
+                    label=f"Attack Injected ({trajectory['attack_type']})")
+    if trajectory["mitigation_step"] > 0:
+        plt.axvline(x=trajectory["mitigation_step"], color="purple", linestyle="-", linewidth=2,
+                    label="Mitigator Action")
+
+    plt.title("Cyber-Physical Trajectory (Sample Episode)")
+    plt.ylabel("Water Level")
+    plt.legend(loc="upper left")
+    plt.grid(True, alpha=0.3)
+
+    # Plot 2: CPU Load
+    plt.subplot(2, 1, 2)
+    plt.plot(steps, trajectory["cpus"], label="CPU Load (%)", color="red", alpha=0.7)
+    if trajectory["attack_step"] > 0:
+        plt.axvline(x=trajectory["attack_step"], color="orange", linestyle="-")
+
+    plt.ylabel("CPU %")
+    plt.xlabel("Environment Timestep")
+    plt.legend(loc="upper left")
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(filename)
+    print(f"\n📊 Generated trajectory graph: {filename}")
+    plt.close()
+
+
+def evaluate(episodes=100, debug_mode=True):
+    print(f"\n{'=' * 50}\n🔬 RUNNING GRANULAR 4-AGENT EVALUATION\n{'=' * 50}")
+
     llm = LLMClient(debug_mode=debug_mode)
+    logger = L2MAID_Logger()  # 👉 INITIALIZED LOGGER
     env = L2MAID_MARL_Env(llm_client=llm, debug_mode=debug_mode)
 
-    # 2. Rebuild the Architecture
     obs_dims = {"network_agent": 8, "host_agent": 8, "threat_intel_agent": 7, "mitigator_agent": 11}
     act_dims = {"network_agent": 2, "host_agent": 2, "threat_intel_agent": 2, "mitigator_agent": 4}
     mappo = MAPPO_CTDE(obs_dims, act_dims)
 
-    # 3. Load Trained Weights
     if not load_mappo_models(mappo):
         return
 
-    # 4. Tracking Metrics
-    history = {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "psi_scores": [], "response_times": []}
+    # Advanced Tracking
+    metrics = {
+        "overflow": {"tp": 0, "fn": 0, "response_times": []},
+        "stealth_drain": {"tp": 0, "fn": 0, "response_times": []},
+        "ransomware": {"tp": 0, "fn": 0, "response_times": []}
+    }
+    global_fp = 0
+    global_tn = 0
+    psi_scores = []
+
+    sample_trajectory = {"levels": [], "cpus": [], "attack_step": -1, "mitigation_step": -1, "attack_type": ""}
 
     for ep in range(episodes):
         obs_dict, _ = env.reset()
         deviations = []
         attack_detected = False
         attack_start_step = env.attack_trigger_step
+        current_attack_type = env.attack_type
+
+        # Only save detailed trajectory for the very first episode
+        is_sample_ep = (ep == 0)
+        if is_sample_ep:
+            sample_trajectory["attack_type"] = current_attack_type
+            sample_trajectory["attack_step"] = attack_start_step
 
         while env.agents:
-            # Deterministic Action Selection (No exploration)
+            if is_sample_ep:
+                sample_trajectory["levels"].append(env.level)
+                sample_trajectory["cpus"].append(env.cpu_load)
+
             actions = {}
             with torch.no_grad():
                 for agent in env.agents:
                     obs_tensor = torch.FloatTensor(obs_dict[agent]).unsqueeze(0)
                     logits = mappo.actors[agent].net(obs_tensor)
-                    actions[agent] = torch.argmax(logits).item()  # Greedy selection
+                    actions[agent] = torch.argmax(logits).item()
 
-            # Environment Step
-            next_obs_dict, rewards, terminations, _, _ = env.step(actions)
-
+            # 1. STATE CHECK
             is_anomaly = env.raw_anomaly == 1.0
             mit_act = actions.get("mitigator_agent", 0)
+            current_level = env.level
+            current_cpu = env.cpu_load
 
-            # Metric Tracking: Did the Mitigator execute a defense?
+            # 2. EXTRACT LLM DECISION (For the logger)
+            llm_vec = obs_dict["mitigator_agent"][-3:]
+            llm_choice = "Attack" if llm_vec[0] > 0.5 else "Normal"
+
+            # 3. TAKE STEP
+            next_obs_dict, rewards, terminations, _, _ = env.step(actions)
+
+            # 👉 4. WRITE TO CSV LOGGER
+            logger.log_step(
+                ep, env.steps, current_attack_type, current_level,
+                current_cpu, llm_choice, mit_act, is_anomaly
+            )
+
+            # Metrics
             if is_anomaly:
                 if mit_act > 0 and not attack_detected:
-                    history["tp"] += 1
+                    metrics[current_attack_type]["tp"] += 1
                     attack_detected = True
-                    # Calculate Mean Time To Respond (MTTR)
-                    history["response_times"].append(env.steps - attack_start_step)
+                    metrics[current_attack_type]["response_times"].append(env.steps - attack_start_step)
+                    if is_sample_ep:
+                        sample_trajectory["mitigation_step"] = env.steps
             elif not is_anomaly and mit_act > 0:
-                history["fp"] += 1  # False Alarm Shutdown!
+                global_fp += 1
 
-            # Process Stability Tracking
             if "host_agent" in obs_dict:
                 level_pct = obs_dict["host_agent"][0]
                 deviations.append((level_pct * 100 - 50) ** 2)
@@ -83,36 +156,48 @@ def evaluate(episodes=100, debug_mode=False):
             obs_dict = next_obs_dict
 
             if any(terminations.values()):
-                # If episode ended and attack was missed entirely
                 if env.steps >= attack_start_step and not attack_detected:
-                    history["fn"] += 1
+                    metrics[current_attack_type]["fn"] += 1
                 elif not is_anomaly and mit_act == 0:
-                    history["tn"] += 1  # Successfully did nothing during normal ops
+                    global_tn += 1
 
-        # Calculate Episode PSI
         psi = 1.0 / (np.sqrt(np.mean(deviations)) + 1e-5) if deviations else 0
-        history["psi_scores"].append(psi)
+        psi_scores.append(psi)
 
         if (ep + 1) % 10 == 0:
             print(f"[EVAL] Completed episode {ep + 1}/{episodes}")
 
-    # 5. Final Calculations
-    tp, fp = history["tp"], history["fp"]
-    fn, tn = history["fn"], history["tn"]
+    # Generate the sample plot
+    plot_sample_episode(sample_trajectory)
 
-    dr = (tp / (tp + fn)) * 100 if (tp + fn) > 0 else 0
-    fpr = (fp / (fp + tn)) * 100 if (fp + tn) > 0 else 0
-    mttr = np.mean(history["response_times"]) if history["response_times"] else 0
+    # Calculate overall metrics
+    total_tp = sum(m["tp"] for m in metrics.values())
+    total_fn = sum(m["fn"] for m in metrics.values())
+    all_responses = sum((m["response_times"] for m in metrics.values()), [])
+
+    overall_dr = (total_tp / (total_tp + total_fn)) * 100 if (total_tp + total_fn) > 0 else 0
+    overall_fpr = (global_fp / (global_fp + global_tn)) * 100 if (global_fp + global_tn) > 0 else 0
+    overall_mttr = np.mean(all_responses) if all_responses else 0
 
     print("\n" + "=" * 50)
     print("🏆 FINAL EVALUATION METRICS 🏆")
     print("=" * 50)
     print(f"Total Episodes:                {episodes}")
-    print(f"Detection Rate (DR):           {dr:.2f}%")
-    print(f"False Positive Rate (FPR):     {fpr:.2f}%")
-    print(f"Mean Time To Respond (MTTR):   {mttr:.1f} steps")
-    print(f"Average Process Stability:     {np.mean(history['psi_scores']):.4f}")
+    print(f"Overall Detection Rate (DR):   {overall_dr:.2f}%")
+    print(f"Overall False Positive (FPR):  {overall_fpr:.2f}%")
+    print(f"Average Process Stability:     {np.mean(psi_scores):.4f}")
+    print("\n--- BREAKDOWN BY ATTACK VECTOR ---")
+
+    for atk, data in metrics.items():
+        atk_tp, atk_fn = data["tp"], data["fn"]
+        atk_dr = (atk_tp / (atk_tp + atk_fn)) * 100 if (atk_tp + atk_fn) > 0 else 0
+        atk_mttr = np.mean(data["response_times"]) if data["response_times"] else 0
+        print(f"🔹 {atk.upper()}:")
+        print(f"   Detection Rate: {atk_dr:.1f}%")
+        print(f"   Mean Response:  {atk_mttr:.1f} steps")
+
     print("=" * 50)
+    print("📂 A detailed breakdown of every step has been saved to: logs/defense_performance.csv")
 
 
 if __name__ == "__main__":

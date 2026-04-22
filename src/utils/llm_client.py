@@ -1,8 +1,11 @@
 import requests
-import ast
+import json
+import os
+import re
+
 
 class LLMClient:
-    def __init__(self, url="http://localhost:11434/api/generate", model="llama3.2:1b", debug_mode=False):
+    def __init__(self, url="http://localhost:11434/api/generate", model="llama3", debug_mode=False):
         self.url = url
         self.model = model
         self.debug_mode = debug_mode
@@ -20,51 +23,79 @@ class LLMClient:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        prompt = f"""
-        Analyze this Industrial Control System log:
-        Water Level: {rounded_level}
-        Level Trend (Last 5 mins): {level_trend}
-        Pump Command: {'ON' if pump == 1 else 'OFF'}
-        Valve Command: {'OPEN' if valve == 1 else 'CLOSED'}
-        Host CPU Load: {rounded_cpu}%
-        Known Malicious IoC Detected: {'YES' if ioc_match == 1 else 'NO'}
-        Mitigator ACK (Last Action): {ack_str}
+        # The Strict Pattern Prompt: Shows the model exactly how to behave without yelling at it.
+        prompt = f"""Classify the log using the rules. Output ONLY the bracketed letter.
 
-        Rules for Threat Detection:
-        1. OVERFLOW ATTACK: Pump is ON and Valve is CLOSED.
-        2. FAST DRAIN ATTACK: Pump is OFF and Valve is OPEN while Level is dangerously low.
-        3. LOW & SLOW (APT): Pump is ON, but Level Trend is 'DROPPING'. (Physics mismatch).
-        4. DoS/RANSOMWARE: CPU is > 90% and IoC is YES, regardless of physics.
+Rules:
+[A]: OVERFLOW (Pump ON + Valve CLOSED)
+[B]: DRAIN (Pump OFF + Valve OPEN + Low Level)
+[C]: APT (Pump ON + Level Trend DROPPING)
+[D]: RANSOMWARE (CPU > 90% + IoC YES)
+[E]: NORMAL (None of the above)
 
-        If ANY of these conditions are met, this is a cyber attack. 
-        Note: If Mitigator ACK is 'Full Shutdown' or 'Port Isolated', the threat may be temporarily contained.
-        Output exactly a python list of three floats (Threat, Normal, Isolate). Example: [0.9, 0.1, 0.9] if attack, [0.1, 0.9, 0.1] if normal.
-        Only output the list, no text.
-        """
+Log: Pump: ON, Valve: CLOSED, CPU: 20%, Trend: RISING, IoC: NO
+Output: [A]
+
+Log: Pump: ON, Valve: OPEN, CPU: 20%, Trend: STABLE, IoC: NO
+Output: [E]
+
+Log: Pump: OFF, Valve: OPEN, CPU: 20%, Trend: DROPPING, IoC: NO
+Output: [B]
+
+Log: Pump: {'ON' if pump == 1 else 'OFF'}, Valve: {'OPEN' if valve == 1 else 'CLOSED'}, CPU: {rounded_cpu}%, Trend: {level_trend}, IoC: {'YES' if ioc_match == 1 else 'NO'}
+Output:"""
 
         try:
             response = requests.post(self.url, json={
                 "model": self.model,
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "options": {
+                    "temperature": 0.2  # Forces the model to be 100% robotic and deterministic
+                }
             }, timeout=30)
 
-            output_text = response.json()["response"].strip()
+            output_text = response.json()["response"].strip().upper()
 
-            if "[" in output_text and "]" in output_text:
-                output_text = output_text[output_text.find("["):output_text.find("]") + 1]
+            # The Forgiving Regex Sniper
+            choices = re.findall(r'\[\s*([A-E])\s*\]', output_text)
 
-            semantic_vector = ast.literal_eval(output_text)
+            if choices:
+                final_choice = choices[-1]
 
-            if len(semantic_vector) == 3:
-                self.cache[cache_key] = semantic_vector
+                vector_map = {
+                    "A": [0.9, 0.1, 0.1],
+                    "B": [0.1, 0.9, 0.1],
+                    "C": [0.5, 0.5, 0.1],
+                    "D": [0.1, 0.1, 0.9],
+                    "E": [0.0, 0.0, 0.0]
+                }
+
+                semantic_vector = vector_map.get(final_choice, [0.0, 0.0, 0.0])
+
                 if self.debug_mode:
-                    print(f"  [LLM] ✅ Ollama: {semantic_vector}. Cached.")
-                return semantic_vector
+                    print(f"\n👀 [RAW OLLAMA]: {output_text}")
+                    print(f"  [LLM] ✅ Conclusion '{final_choice}' mapped to {semantic_vector}")
+            else:
+                semantic_vector = [0.0, 0.0, 0.0]
+                if self.debug_mode:
+                    print(f"\n👀 [RAW OLLAMA]: {output_text}")
+                    print(f"  [LLM] ⚠️ No bracketed [A-E] found. Defaulting to Normal [0.0, 0.0, 0.0].")
+
+            self.cache[cache_key] = semantic_vector
+            return semantic_vector
 
         except Exception as e:
             if self.debug_mode:
-                print(f"  [LLM] ⚠️ Ollama failed. Error: {e}")
-            return [0.5, 0.5, 0.0]
+                print(f"  [LLM] ⚠️ CRASH/TIMEOUT! Defaulting to [0.0, 0.0, 0.0]")
+            return [0.0, 0.0, 0.0]
 
-        return [0.5, 0.5, 0.0]
+    def save_cache(self, filepath="models/llm_cache.json"):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(self.cache, f)
+
+    def load_cache(self, filepath="models/llm_cache.json"):
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                self.cache = json.load(f)

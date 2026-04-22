@@ -1,6 +1,6 @@
+import os
 import torch
 import numpy as np
-import os
 import matplotlib.pyplot as plt
 from src.utils.llm_client import LLMClient
 from src.utils.logger import L2MAID_Logger
@@ -38,14 +38,14 @@ def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
     plt.axhline(y=100.0, color="red", linestyle=":", label="Catastrophic Overflow")
     plt.axhline(y=0.0, color="red", linestyle=":", label="Catastrophic Drain")
 
-    if trajectory["attack_step"] > 0:
+    if trajectory["attack_step"] >= 0:
         plt.axvline(
             x=trajectory["attack_step"],
             color="orange",
             linestyle="-",
             label=f"Attack Injected ({trajectory['attack_type']})"
         )
-    if trajectory["mitigation_step"] > 0:
+    if trajectory["mitigation_step"] >= 0:
         plt.axvline(
             x=trajectory["mitigation_step"],
             color="purple",
@@ -62,7 +62,7 @@ def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
     # Plot 2: CPU Load
     plt.subplot(2, 1, 2)
     plt.plot(steps, trajectory["cpus"], label="CPU Load (%)", color="red", alpha=0.7)
-    if trajectory["attack_step"] > 0:
+    if trajectory["attack_step"] >= 0:
         plt.axvline(x=trajectory["attack_step"], color="orange", linestyle="-")
 
     plt.ylabel("CPU %")
@@ -76,10 +76,12 @@ def plot_sample_episode(trajectory, filename="sample_episode_trajectory.png"):
     plt.close()
 
 
-def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
+def evaluate(episodes=100, debug_mode=False, use_rule_based_mitigator=False):
     print(f"\n{'=' * 50}\n🔬 RUNNING GRANULAR 4-AGENT EVALUATION\n{'=' * 50}")
 
     llm = LLMClient(debug_mode=debug_mode)
+    llm.load_cache()
+
     logger = L2MAID_Logger()
     env = L2MAID_MARL_Env(llm_client=llm, debug_mode=debug_mode)
 
@@ -112,6 +114,7 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
         "stealth_drain": {"tp": 0, "fn": 0, "response_times": []},
         "ransomware": {"tp": 0, "fn": 0, "response_times": []}
     }
+
     global_fp = 0
     global_tn = 0
     psi_scores = []
@@ -147,26 +150,23 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
 
             with torch.no_grad():
                 for agent in env.agents:
-                    obs_tensor = torch.FloatTensor(obs_dict[agent]).unsqueeze(0)
+                    obs_tensor = torch.as_tensor(obs_dict[agent], dtype=torch.float32).unsqueeze(0)
                     logits = mappo.actors[agent].net(obs_tensor)
-                    actions[agent] = torch.argmax(logits, dim=-1).item()
+                    actions[agent] = int(torch.argmax(logits, dim=-1).item())
 
-            # Temporary diagnostic override for the mitigator:
-            # mitigator obs = [level, pump, valve, cpu, ioc_match] + comm_buffer + llm_vector
             if use_rule_based_mitigator and "mitigator_agent" in obs_dict:
                 ioc_match = obs_dict["mitigator_agent"][4]
                 actions["mitigator_agent"] = 1 if ioc_match > 0.5 else 0
 
             mit_act = actions.get("mitigator_agent", 0)
-            mitigator_action_hist[mit_act] = mitigator_action_hist.get(mit_act, 0) + 1
+            mitigator_action_hist[mit_act] += 1
 
             # State before stepping
             is_anomaly = env.raw_anomaly == 1.0
             current_level = env.level
             current_cpu = env.cpu_load
-
             llm_vec = obs_dict["mitigator_agent"][-3:]
-            llm_choice = "Attack" if llm_vec[0] > 0.5 else "Normal"
+            llm_choice = f"[{llm_vec[0]:.2f}, {llm_vec[1]:.2f}, {llm_vec[2]:.2f}]"
 
             next_obs_dict, rewards, terminations, _, _ = env.step(actions)
 
@@ -181,6 +181,7 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
                 is_anomaly
             )
 
+            # Step-level detection / FP / TN accounting
             if is_anomaly:
                 if mit_act > 0 and not attack_detected:
                     metrics[current_attack_type]["tp"] += 1
@@ -188,22 +189,23 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
                     metrics[current_attack_type]["response_times"].append(env.steps - attack_start_step)
                     if is_sample_ep:
                         sample_trajectory["mitigation_step"] = env.steps
-            elif not is_anomaly and mit_act > 0:
-                global_fp += 1
+            else:
+                if mit_act > 0:
+                    global_fp += 1
+                else:
+                    global_tn += 1
 
             if "host_agent" in obs_dict:
                 level_pct = obs_dict["host_agent"][0]
-                deviations.append((level_pct * 100 - 50) ** 2)
+                deviations.append((level_pct * 100.0 - 50.0) ** 2)
 
             obs_dict = next_obs_dict
 
             if any(terminations.values()):
-                if env.steps >= attack_start_step and not attack_detected:
+                if env.steps > attack_start_step and not attack_detected:
                     metrics[current_attack_type]["fn"] += 1
-                elif not is_anomaly and mit_act == 0:
-                    global_tn += 1
 
-        psi = 1.0 / (np.sqrt(np.mean(deviations)) + 1e-5) if deviations else 0
+        psi = 1.0 / (np.sqrt(np.mean(deviations)) + 1e-5) if deviations else 0.0
         psi_scores.append(psi)
 
         if (ep + 1) % 10 == 0:
@@ -215,9 +217,9 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
     total_fn = sum(m["fn"] for m in metrics.values())
     all_responses = sum((m["response_times"] for m in metrics.values()), [])
 
-    overall_dr = (total_tp / (total_tp + total_fn)) * 100 if (total_tp + total_fn) > 0 else 0
-    overall_fpr = (global_fp / (global_fp + global_tn)) * 100 if (global_fp + global_tn) > 0 else 0
-    overall_mttr = np.mean(all_responses) if all_responses else 0
+    overall_dr = (total_tp / (total_tp + total_fn)) * 100 if (total_tp + total_fn) > 0 else 0.0
+    overall_fpr = (global_fp / (global_fp + global_tn)) * 100 if (global_fp + global_tn) > 0 else 0.0
+    overall_mttr = float(np.mean(all_responses)) if all_responses else 0.0
 
     print("\n" + "=" * 50)
     print("🏆 FINAL EVALUATION METRICS 🏆")
@@ -234,8 +236,8 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
     print("\n--- BREAKDOWN BY ATTACK VECTOR ---")
     for atk, data in metrics.items():
         atk_tp, atk_fn = data["tp"], data["fn"]
-        atk_dr = (atk_tp / (atk_tp + atk_fn)) * 100 if (atk_tp + atk_fn) > 0 else 0
-        atk_mttr = np.mean(data["response_times"]) if data["response_times"] else 0
+        atk_dr = (atk_tp / (atk_tp + atk_fn)) * 100 if (atk_tp + atk_fn) > 0 else 0.0
+        atk_mttr = float(np.mean(data["response_times"])) if data["response_times"] else 0.0
         print(f"🔹 {atk.upper()}:")
         print(f"   Detection Rate: {atk_dr:.1f}%")
         print(f"   Mean Response:  {atk_mttr:.1f} steps")
@@ -245,4 +247,4 @@ def evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True):
 
 
 if __name__ == "__main__":
-    evaluate(episodes=100, debug_mode=True, use_rule_based_mitigator=True)
+    evaluate(episodes=100, debug_mode=False, use_rule_based_mitigator=False)

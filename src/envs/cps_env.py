@@ -32,8 +32,8 @@ class L2MAID_MARL_Env(ParallelEnv):
 
         self.max_steps = 60
         self.setpoint = 50.0
-        self.w_sec = 1.0
-        self.w_proc = 2.0
+        self.w_sec = 5.0
+        self.w_proc = 1.0
 
         self.level_history = deque(maxlen=5)
 
